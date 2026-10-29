@@ -1,169 +1,314 @@
-# SGK — an idea for a Space Propulsion Designer
+# SGK (Space Generative Kernel)
 
-This is a pre-design document for SGK (Space Generative Kernel) a small, open-source software experiment: a tool that takes an engine concept and carries it through the whole design chain — geometry, physics, optimization — across engine families: chemical, electric, nuclear.
+SGK is a personal open-source project for propulsion analysis and design. The intended workflow is to define an engine case, generate its geometry, evaluate it and compare design changes through a straightforward interface. Cases and results should remain easy to inspect and reuse.
 
-The scope is quite broad at this stage. The full system does not exist yet; what exists is a plan, and a small validation slice — sgk-mini, described at the end — whose only job is to check whether the plan makes sense before investing in it.
+The central objective is to bypass expensive simulations during most design iterations through fast model inference. Reference analyses (CFD, FEM or plasma simulations, depending on the problem) provide training data and checks on selected configurations. The software connects preliminary physics, geometry generation, learned models and design search.
 
-## Design goals
+This document defines the pre-design. The repository currently contains the specifications and license; the SGK application is still to be implemented. **Adopted** below means a design choice for that implementation. **Open** identifies a decision that requires a defined physical case or an experiment.
 
-These are targets, not achieved results:
+## Scope
 
-- Push the software side of the design process as far as it goes, so that fewer physical tests are needed to close a design iteration.
-- Replace routine CFD with a trained surrogate wherever the surrogate's accuracy is sufficient for the decision being made. CFD/FEM remains for dataset generation and final verification.
-- Produce a metal 3D-printable (L-PBF) engine as the native output, not as an afterthought on top of a traditionally designed geometry. This is reachable with today's technology and liquid chemical propulsion.
-- Keep the architecture family-agnostic from the start: adding an engine family means adding a physics module, not rewriting the pipeline.
+SGK targets all propulsion families listed below. Liquid chemical propulsion is the starting point for implementation; the architecture and overall scope cover chemical, electric and nuclear propulsion.
 
-## The four layers
+| Stage | Scope |
+|---|---|
+| First application | Liquid chemical propulsion, with parameterized geometry and one bounded physical analysis |
+| Extension of the liquid baseline | Cooling, structural response, coupled fields and changing operating conditions |
+| Overall scope | All listed propulsion families, each with its own physical case and evaluation path |
+| Product target | A usable design workflow with inspectable geometry, physical results, comparisons and exportable cases |
 
-The pre-design is organized in four layers, each depending only on the one before it:
+The first liquid case is open. A nozzle-flow problem or cooling-channel study is a candidate. Its parameters, equations, reference solver and target outputs must be defined before producing a propulsion dataset.
 
-| Layer | Function | Technology | Role in the pipeline |
+Manufacturing constraints are part of the intended geometry design. For metal additive manufacturing (L-PBF), this includes wall and channel dimensions, build orientation and access for support or powder removal. Process-specific limits and export requirements remain to be selected.
+
+## Architecture
+
+| Layer | Responsibility | Input | Output |
 |---|---|---|---|
-| 1 — Geometry | Generate engine geometry from 0D/1D analytical physics | C# / .NET, PicoGK, LEAP71 ShapeKernel and LatticeLibrary | Turns physical relations into a voxel engine, ready for L-PBF printing (.vdb/.nvdb) |
-| 2 — Physics surrogates | Fast neural inference on pressure, temperature, velocity and stress fields | Python, PyTorch, NVIDIA PhysicsNeMo, GINO (+ optionally PINO) | Replaces CFD/FEA in early design phases, including for geometries not seen in training |
-| 3 — Generative optimization | Search the design space for better geometries against a stated objective | Bayesian optimization / genetic algorithms | Uses Layer 2 as a fast oracle, so thousands of variants can be evaluated without running real CFD |
-| 4 — Conversational interface | Natural-language control of the design | LLM with function calling over a JSON schema | Translates commands into Layer 1 parameter changes, triggering regeneration and re-evaluation |
+| 1. Preliminary physics and geometry | Resolve sizing targets and generate a parameterized geometry | Physical case, design parameters and operating conditions | Geometry, named domains and boundaries, derived physical quantities |
+| 2. Fast physical evaluation | Predict the response of a supported case | Geometry representation, physical conditions and trained model | Fields or engineering quantities, model identity and applicability information |
+| 3. Design search | Propose parameter changes and evaluate objectives and constraints | Parameter bounds, objective definitions and evaluation results | Candidate history, comparisons and reference-checked designs |
+| 4. User interface | Configure, inspect and run the numerical workflow | User edits or structured requests | Case changes, geometry views and result comparisons |
 
-### Layer 1 — Geometry
+Reference solvers generate training data and verify selected designs; trained surrogates provide the fast evaluations used during design search.
 
-The first layer generates the engine geometry from 0D/1D analytical physics — the standard toolbox of preliminary design: chamber sizing, nozzle contour, wall thickness, heat transfer. All closed-form relations, nothing exotic; the layer is meant to be simple, deterministic, and fast.
+### Tools and selection status
 
-The geometry is a voxel field, not a CAD model, for a practical reason. A regeneratively-cooled liquid engine has a dense network of cooling channels — easily a hundred of them — and boolean operations on B-Rep kernels get unstable on that kind of topology. Voxel fields sidestep the problem: booleans become set operations on a grid. The geometric core builds on PicoGK, LEAP71's open-source voxel kernel (the same kernel behind their Noyron models), so the hard part is already done by someone else.
-
-Manufacturability is part of the geometric computation itself: minimum wall thickness, self-supporting overhang angles and dimensional tolerances are imposed while generating the geometry, not checked afterwards on a finished model. The output is a voxel field (.vdb/.nvdb) meant to be printable directly.
-
-The layer accepts two parallel input modes:
-
-- **Mission-driven (high level):** delta-v, vehicle architecture, power budget, target mass, operating environment. Engine parameters are derived through inverse sizing.
-- **Engine-driven (low level):** thrust, specific impulse, chamber pressure, oxidizer-to-fuel ratio, nozzle expansion ratio.
-
-Both converge on the same `EngineConfig` schema, and the system translates between the two levels in both directions.
-
-### Layer 2 — Physics surrogates
-
-The second layer replaces routine CFD/FEM evaluation with a trained neural operator. The candidate model is GINO (Geometry-Informed Neural Operator, NVIDIA/Caltech, NeurIPS 2023) — from what I've read, it is not a single network but a three-stage pipeline:
-
-1. A geometry encoder (local GNO): the engine surface is discretized into a point cloud; each point of a regular latent grid is connected through a graph to nearby points of the actual geometry within a radius, and a learned kernel aggregates local geometric information.
-2. A global model (FNO blocks): the latent representation, concatenated with the signed distance function of the geometry, is processed by Fourier layers on a regular grid via FFT — capturing interactions along the whole engine (for example, pressure waves across the full nozzle length).
-3. A geometry decoder (local GNO): the result is projected back onto the original surface points, returning pressure, temperature and stress fields exactly where they are needed.
-
-Training follows the standard pattern of NVIDIA PhysicsNeMo (formerly Modulus): a dataloader returns (geometry as point cloud + SDF, ground-truth physical field) pairs; GINO is available as a ready-made model in the framework; the loop is standard PyTorch — MSE loss against CFD/FEM ground truth, Adam optimizer, learning-rate scheduling — with multi-GPU training, logging and checkpointing provided by the library.
-
-One point that came up while researching this: fVDB is not a native component of GINO. GINO's published pipeline works on point clouds and SDFs with hash-grid neighbor search (Open3D CUDA); fVDB is a separate framework for differentiable sparse voxel representations. In SGK, its plausible role is a pre-processing step — extracting surfaces and SDF values from the high-resolution .vdb/.nvdb files produced by PicoGK, to feed GINO the input format it expects. I haven't found this specific combination documented publicly, so it is an open technical risk to prototype on a minimal case before building the full data pipeline.
-
-PINO (Physics-Informed Neural Operator) is considered complementary rather than an alternative: GINO handles the geometric representation, PINO reduces the amount of CFD/FEM ground truth needed by adding physical constraints to the training loss.
-
-The quantitative anchor for sizing the dataset is the published GINO reference — 500 automotive geometries (Ahmed-body dataset), 7.2 million mesh points each, Reynolds numbers up to 6.8 million, 8.31% error on the full pressure field, roughly 26,000× speedup over OpenFOAM for drag evaluation. Those numbers come from the paper and an unrelated geometry class; they are used here only to size the approach, not as results obtained for propulsion.
-
-Layer 2/3/4 claims have not been measured on SGK's own geometry yet.
-
-### Layer 3 — Generative optimization
-
-The third layer does not replace Layer 1; it drives it:
-
-1. It proposes a variation of Layer 1 parameters (for example, local nozzle contour curvature, cooling channel width) via Bayesian optimization or a genetic algorithm.
-2. Layer 1 regenerates the corresponding voxel geometry — deterministic, in milliseconds.
-3. The trained Layer 2 surrogate evaluates the physical performance of the new geometry in milliseconds, acting as a fast oracle in place of real CFD.
-4. The response drives the next search direction, iterating to an optimum or a multi-objective Pareto front (for example, maximizing specific impulse while keeping peak wall temperature below a structural limit).
-
-No real CFD runs inside the optimization loop itself; each evaluation costs a surrogate inference instead of hours of simulation. That is what makes exploring thousands of variants tractable.
-
-### Layer 4 — Conversational interface
-
-The fourth layer is an LLM with function calling over a JSON schema matching `EngineConfig`. It translates natural-language design commands into Layer 1 parameter changes, triggering geometry regeneration and, where relevant, re-evaluation through Layers 2 and 3. It carries no physics of its own — it is a controlled interface onto the deterministic core.
-
-## Dataset strategy
-
-The dataset strategy does not assume a large dataset is required. The GINO reference — under 10% pressure-field error on a complex industrial geometry class with 500 high-fidelity samples — suggests that for a geometry-aware neural operator, the distribution and quality of the samples matter more than the raw count.
-
-The procedure has four steps:
-
-1. **Define the parameter space.** Engine design variables — chamber pressure, oxidizer-to-fuel ratio, nozzle expansion ratio, cooling channel geometry and count, structural wall thicknesses — with physically admissible ranges.
-2. **Sample with Latin Hypercube Sampling.** LHS covers a multidimensional parameter space uniformly with a controlled, minimal number of samples, avoiding redundant coverage of similar design points.
-3. **Generate geometry for every sample via Layer 1.** Deterministic and milliseconds per sample, so it can run for thousands of parameter combinations at no meaningful cost.
-4. **Run high-fidelity CFD/FEM only on the selected subset.** Only the LHS-selected samples are sent to CFD (OpenFOAM) and FEM for ground-truth generation.
-
-Based on the GINO reference point, a realistic first estimate for a working Layer 2 on liquid chemical engines is **300–800 high-fidelity CFD/FEM simulations** even if that may still be too many for a single developer. This estimate will, of course, be revised when the first dataset is actually generated.
-
-The ground truth of each sample includes more than a converged steady-state snapshot:
-
-- pressure trace along chamber and nozzle, including transients;
-- thrust trace, including startup/shutdown transients;
-- wall temperature distribution, to capture hot spots and melting risk;
-- regenerative cooling effectiveness per channel (flow and temperature), not an aggregate average;
-- mechanical stress field (FEM), for structural margin under combined thermal and pressure load.
-
-Crowdsourced simulation contribution is a possible path to scale beyond the internal dataset, but only after the first surrogate has been validated on an internally controlled dataset — with standardized containers (fixed mesh generation, solver version, boundary conditions) and an automatic validation pipeline (convergence checks, mass/energy balance checks) before contributed simulations are trusted as training data.
-
-## Engine families
-
-The shared infrastructure — PicoGK geometry, the surrogate pipeline, the conversational layer — is never rewritten when a new family is added. Every family implements the same abstract contract (`GenerateGeometry()`, `ComputeThermodynamics()`, `ExportVDB()`) from a common `EngineBase`; Layers 2 through 4 remain unchanged regardless of the family. Each family brings its own physics module, rather than force-fitting one from another domain.
-
-The intended class structure:
-
-```
-EngineBase
-├── ChemicalEngine
-│   ├── LiquidEngine
-│   │   ├── LiquidBipropEngine (pump-fed / pressure-fed)
-│   │   └── LiquidMonopropEngine
-│   ├── SolidEngine
-│   └── HybridEngine
-├── ElectricEngine
-│   ├── HallEffectEngine
-│   ├── IonEngine (grid-based)
-│   ├── MPDEngine
-│   └── MicrowaveElectrothermalEngine
-├── NuclearThermalEngine (NTP)
-├── NuclearElectricEngine (NEP)
-└── FusionEngine
-    ├── MagneticNozzleEngine
-    └── PlasmaConfinementModule (MHD)
-```
-
-| Family | Dedicated physics module | Notes |
+| Component | Choice | Status and purpose |
 |---|---|---|
-| Solid | Internal ballistics, grain surface regression | Reuses voxel geometry and the chamber/nozzle toolbox adapted to a solid chamber |
-| Hybrid | Solid grain regression + liquid/gaseous oxidizer injection | Composition of the solid and liquid modules |
-| Hall / ion | Child-Langmuir law, low-density plasma dynamics | Physically separate from neutral-gas flow; needs its own dataset and surrogate model |
-| MPD | Magnetohydrodynamic equations (Lorentz force, applied current) | Conceptual precursor of the fusion module; partially reusable |
-| Microwave electrothermal | Microwave plasma heating, expansion through a conventional nozzle | Closest bridge to chemical engines (continuous neutral/partially ionized flow) |
-| NTP | Reactor-to-propellant heat exchange, then convergent-divergent expansion | Natural extension of the chemical equations with a different heat source |
-| NEP | Reactor + electrical power conversion + downstream electric thruster | Composition of reactor and electric modules; no new nozzle physics |
-| Fusion | Magnetic confinement, coil configuration, MHD | Most speculative and complex module; treated as its own domain with a dedicated dataset and training run |
+| Geometry core | C#/.NET and [PicoGK](https://github.com/leap71/PicoGK) | Adopted for parameterized voxel geometry |
+| Model environment | Python and PyTorch | Adopted for training and inference |
+| Fluid reference solver | OpenFOAM | Candidate for the first fluid case; solver and version depend on the selected equations |
+| Operator architecture | GNO/FNO composition, with [GINO](https://arxiv.org/html/2309.00583v1) as a reference | Candidate for variable geometry and field prediction |
+| Physical training constraints | Equation and boundary residuals, informed by [PINO](https://arxiv.org/abs/2111.03794) | Experiment to compare with supervised training |
+| Model framework | [NVIDIA PhysicsNeMo](https://github.com/NVIDIA/physicsnemo) | Candidate source of operator implementations and training components |
+| Sparse voxel processing | [fVDB](https://github.com/openvdb/fvdb-core) | Optional, subject to the geometry-to-model conversion requirements |
+| Geometry helpers | LEAP71 ShapeKernel and LatticeLibrary | Optional for operations that justify their use |
+| Search algorithm | Parameter sweep first; optimization method open | Establish a baseline before selecting Bayesian or population-based search |
+| Interface | File-based/command-line access, then graphical and conversational controls | Adopted order; concrete interface technologies remain open |
 
-## Development order
+## Pipelines
 
-Development starts with liquid chemical propulsion, for a practical reason: it is a family complex enough that every step of the chain — analytical geometry, physical plausibility, surrogate accuracy — can be checked against public reference data. That makes it the environment where the pipeline gets proven end to end, before pointing it at families where the reference data is sparser and the physics harder to validate independently.
+### Reference data and model training
 
-The concrete sequence is:
+```text
+physical case + parameters + operating conditions
+    -> preliminary sizing
+    -> geometry + named domains and boundaries
+    -> solver mesh + numerical configuration
+    -> reference analysis
+    -> checked fields and engineering quantities
+    -> geometry/field sampling + normalization
+    -> training dataset
+    -> trained model + preprocessing + evaluation report
+```
 
-1. **sgk-mini** (in progress): a deliberately small companion project that validates the stack on a controlled case in order to correct/tune the SGK pre-design toolchain (see Status).
-2. **First complete problem in SGK proper:** a small but complete liquid engine — a blowdown configuration, for example — simple enough to close the whole loop (geometry, physics, validation) end to end, and real enough to matter.
-3. **Expand** the liquid family, then add families one at a time, each through its own physics module and its own validation.
+The reference-analysis path handles mesh generation, boundary-condition assignment, solver execution and result extraction. Only accepted numerical results enter the training targets; failed or unconverged runs retain their diagnostics.
 
+Each training sample links a geometry representation and operating conditions to reference outputs at identified locations. For a field target, the sample retains the query coordinates and corresponding values; for an integrated quantity, it retains the integration definition and units.
 
-## Status
+### Design iteration
 
-This repository currently contains only this pre-design document. None of the four layers is implemented here.
+```text
+candidate parameters
+    -> sizing and geometry generation
+    -> applicability checks
+    -> fast inference
+    -> objectives and constraints
+    -> candidate comparison
+    -> next parameter proposal
+```
 
-End-to-end technical validation is carried out in a separate companion repository, **sgk-mini**, whose purpose is to check that the stack stands up on a small controlled case before investing engineering time in the full architecture. So far, sgk-mini has validated:
+Selected candidates return to the reference solver for verification. Cases outside the supported domain are rejected or scheduled for reference analysis. New reference data can support a later training cycle; switching models requires re-evaluating candidates used in a common comparison.
 
-- PicoGK voxel geometry generation and round-trip serialization to .vdb on Fedora 44 / .NET 9, with PicoGK's native runtime built from source (no official Linux binary is distributed upstream);
-- a minimal hollow-cylinder geometry to compute an annular water flow, with feature extraction and JSON round-tripping through independent code paths;
-- an analytical physics benchmark: steady, fully developed laminar axial flow in a concentric annulus, with both global targets (mean velocity, Reynolds number, pressure gradient and drop) and local targets (velocity profile, wall shear stress);
-- OpenFOAM `simpleFoam` validated against that analytical benchmark on two geometric configurations (narrow gap and wide gap), reaching: peak velocity (Umax) error 0.023%, pressure-gradient error 0.74%, flow-rate error 0.86%, and a mean near-wall profile error of 3.6%, attributed to second-order finite-volume discretization at this aspect ratio rather than to an implementation defect.
+The initial search is **parametric**: it explores shapes expressible by the geometry generator and its permitted parameters. Free-form topology generation is outside the current pre-design.
 
-Still missing in sgk-mini: building a small (geometry, CFD field) dataset, training a first tiny PhysicsNeMo surrogate, testing its inference accuracy and speed against the analytical/CFD ground truth, and closing a minimal Layer 3 optimization loop.
+## Data exchanged between components
 
-Open design points, not yet finalized:
+The following names identify logical records. Exact field names, types and file formats remain open.
 
-- the fVDB → SDF/point cloud → GINO integration, to be prototyped on a minimal case;
-- the exact LHS parameter space and sampling resolution;
-- the crowdsourcing quality-control pipeline;
-- Layer 2 acceptance error thresholds;
-- the public reference engine set for Layer 1 physical validation (NASA open data).
+| Record | Contents | Role |
+|---|---|---|
+| Case (`EngineConfig`) | Geometry parameters, sizing targets, operating conditions, equations/closures, properties, boundary conditions and assumptions | Complete definition of the physical problem |
+| Geometry | Case identity, voxel/surface representation, dimensions, coordinate frame, resolution, solid/fluid domains and boundary labels | Shared geometric description for meshing, sampling and viewing |
+| Reference run | Case and geometry identity, solver configuration, fields, integrated quantities, diagnostics and numerical checks | Evidence produced by a reference analysis |
+| Trained model | Architecture/configuration, weights, preprocessing, normalization, input/output definitions, data revision and evaluation report | Reusable predictor with a declared domain of use |
+| Evaluation | Link to a reference run or model inference, engineering quantities, applicability and constraint results | Common summary consumed by the search and comparison interface |
+
+Large fields remain in the referenced run or inference artifacts. The evaluation record contains the quantities needed for comparison and links to those artifacts, avoiding a second copy of the physical result.
+
+**Exchange conventions**
+
+- SI units for physical exchange; explicit conversion at geometry-library boundaries, including millimetres in PicoGK.
+- Defined coordinate frames, vector components and surface-normal orientation.
+- A new case revision when geometry, conditions, properties or the physical formulation changes.
+- Separate identities for cases, reference runs, datasets and trained models. Storage and revision mechanisms remain open.
+
+## Layer 1: preliminary physics and geometry
+
+### Input modes
+
+| Mode | Definition | Status |
+|---|---|---|
+| Engine-driven | Independent physical/design parameters plus a sizing target; remaining quantities derived from the selected model | Initial mode |
+| Mission-driven | Mission requirements translated into candidate engine cases through assumptions, objectives and constraints | Later extension |
+
+For a liquid case, inputs may include propellant combination, chamber pressure, mixture ratio and expansion ratio. Requested thrust or specific impulse must be distinguished from the performance calculated by the sizing model.
+
+Mission-driven sizing must resolve additional choices such as vehicle mass, available power and operating environment. It produces explicit engine cases for the same downstream pipeline.
+
+### Geometry processing
+
+Voxel geometry is intended to support repeated boolean operations and complex internal passages (e.g. a regenerative cooling network formed by subtracting parameterized channel volumes from the chamber wall). Voxel resolution determines which channel and wall features remain resolved, as well as the memory and computation required.
+
+1. Resolve the independent inputs and derived quantities using the case's preliminary physical models.
+2. Generate voxel geometry at a specified resolution.
+3. Identify solid regions, fluid passages and their interfaces.
+4. Check dimensions, connectivity and the applicable manufacturing constraints.
+5. Export geometry and domain labels for meshing, model preparation and inspection.
+
+Preliminary models may use analytical relations, numerical integration, property tables or equilibrium calculations. Their assumptions and valid ranges belong to the selected case.
+
+Voxel storage, surface extraction and solver meshing are distinct representations. The conversion path must preserve units, domain identity and relevant geometric features. VDB is the intended voxel storage format; surface and solver-specific formats remain open.
+
+Geometry checks cover known-shape dimensions and volumes, channel connectivity, minimum wall thickness and sensitivity to voxel resolution. Manufacturing-oriented exports additionally require the selected process limits and build constraints.
+
+## Layer 2: fast physical evaluation
+
+### Prediction target
+
+The first case must choose between a scalar/vector engineering output (such as pressure drop) and a spatial field (such as pressure or velocity). This choice determines the required representation and architecture.
+
+| Target | Data required | Model consideration |
+|---|---|---|
+| Engineering quantities | Case parameters and reference quantities | Compare a small parameter-to-output predictor with operator methods |
+| Surface fields | Geometry samples, conditions and fields at identified surface locations | GNO/FNO composition is a candidate for variable geometry |
+| Volume fields | Interior sampling/domain representation, conditions and reference fields | Requires an explicit volume-output formulation |
+| Coupled or transient response | Coupled variables, interface conditions, or time and initial conditions | Later extension of the first steady problem |
+
+Geometry and operating conditions are both inputs when conditions vary. Preprocessing and normalization are saved with the trained model and reused during inference.
+
+### GNO/FNO path
+
+The [GINO reference architecture](https://arxiv.org/html/2309.00583v1) connects irregular geometry samples to a regular latent grid and decodes the result at query locations. Encoding and decoding refer to learned feature transformations; the decoder predicts a physical field at those locations.
+
+```text
+PicoGK geometry
+    -> surface samples + signed distance function (SDF)
+    -> GNO encoder: irregular samples -> latent grid features
+    -> concatenate SDF values on the latent grid
+    -> FNO blocks: global processing on the regular grid
+    -> GNO decoder: latent grid -> query-point features
+    -> output projection -> predicted physical field
+```
+
+| Stage | Operation |
+|---|---|
+| Geometry encoding | For each latent-grid location, find geometry samples within a specified radius. A learned kernel aggregates their local information into feature channels on the grid. |
+| Latent processing | Combine encoded geometry with SDF values. FNO blocks use Fourier transforms and learned spectral operations to exchange information across the grid. |
+| Field decoding | For each query point, aggregate neighboring latent-grid features through a graph operator, then project the resulting features to the requested physical variables. |
+
+The published examples predict surface pressure. SGK's output variables, operating-condition inputs and any volume-field extension remain case-specific choices.
+
+**SGK data preparation (proposed):**
+
+| Data | Representation and use |
+|---|---|
+| Geometry samples | Coordinates of surface points in a common frame; sampling must preserve relevant boundaries and small features |
+| Latent grid | Regular spatial coordinates with chosen extent and resolution; stores encoded feature channels |
+| Distance values | Signed distances evaluated at grid locations, with an explicit sign convention and scale |
+| Operating conditions | Case variables and boundary-condition information; their injection into the network is still to be defined |
+| Query locations | Coordinates where the field is requested, paired with reference values during supervised training |
+| Outputs | Named physical variables at the query locations, converted back to physical units |
+
+Encoder, latent blocks and decoder are trained together against the reference outputs. Inference uses the saved weights and preprocessing with new geometry and conditions, without requiring reference values at the query points.
+
+The implementation sequence is to check geometry/SDF extraction, construct the encoder and decoder neighborhoods, verify tensor shapes and coordinate mappings, then train a small supervised case before adding physical residuals. Open choices include sampling density, grid resolution, neighborhood radii, feature widths, conditioning and loss normalization. Whether extraction needs fVDB remains open.
+
+### Physics-informed training
+
+The proposed experiment adds governing-equation and boundary-condition residuals to a supervised predictor. It requires:
+
+- the equations, variables and boundary conditions of the physical case;
+- a derivative/residual evaluation method compatible with the representation;
+- scaling and weighting of data and physical losses;
+- checks of residual evaluation against known fields.
+
+Compare supervised training with the added physical losses on the same data splits. Measure prediction errors, conservation behavior, data requirements and training cost. Loss formulation for discontinuities or coupled physics remains a separate decision.
+
+### Dataset and evaluation
+
+| Item | Definition |
+|---|---|
+| Parameter space | Geometry and operating ranges, fixed assumptions and admissibility conditions |
+| Initial sampling | A small controlled design of experiments; Latin hypercube sampling is one candidate |
+| Dataset growth | Guided by pilot results, learning curves and errors relevant to design decisions |
+| Splits | Group by physical case; keep points, time steps and resolutions from a case together when evaluating new-case generalization |
+| Model selection | Validation split for tuning; final test split reserved for the fixed evaluation protocol |
+| Metrics | Field errors and engineering-output errors, including local extrema or constraint-critical regions |
+
+Reference quality is assessed through discretization sensitivity, conservation and analytical or independent comparisons where available. Numerical verification and comparison with experimental measurements must be reported separately.
+
+Dataset size, acceptance tolerances and the available compute budget are open. Quantitative results from unrelated geometry classes do not set those values for SGK.
+
+### Applicability and inference
+
+An inference request identifies the case, model revision and requested outputs. Its result includes predictions and the outcome of the declared applicability checks.
+
+Input compatibility, applicability and prediction accuracy are separate properties. Initial checks can cover schema, parameter bounds and supported geometry classes. Recognition of unfamiliar topology or physical regimes, uncertainty estimation and the fallback policy remain open design decisions.
+
+Measure inference cost together with input preparation and data transfer. Report the model's test errors and applicable domain alongside timing results.
+
+## Layer 3: design search
+
+**Search definition:** adjustable parameters, bounds, objective quantities, constraints, initial candidates and an evaluation budget.
+
+1. Propose a parameter change and regenerate the geometry.
+2. Evaluate through the surrogate when the applicability policy permits it.
+3. Calculate objectives and constraints separately.
+4. Select candidates for reference checks or further exploration.
+5. Compare reference results with predictions and retain the candidate history.
+
+A small sweep or random search provides the first baseline. The optimization method is selected from the dimension and structure of the parameter space and the evaluation cost.
+
+**Examples of possible design studies (e.g., for liquid propulsion):**
+
+| Study | Adjustable geometry | Fixed conditions and comparison |
+|---|---|---|
+| Regenerative cooling passage | Channel width and depth along the axial coordinate, rib width and hot-wall thickness | Specify gas-side thermal loading, coolant inlet state and total flow. Compare coolant pressure drop and wall mass subject to peak wall-temperature and stress limits. |
+| Nozzle contour | Contour control points between a fixed throat and exit | Hold throat area, exit area, chamber state and ambient pressure fixed. Compare axial thrust and nozzle length, with flow and thermal constraints defined for the operating case. |
+
+A multi-objective search can return a set of trade-offs (e.g. cooling designs for which reducing pressure drop requires greater wall mass), with feasibility checked by reference analysis. The selected physical case determines which of these quantities can actually be evaluated.
+
+Reference-check selection and stopping criteria remain open. A search may return no feasible design or no improvement; these are valid outcomes to distinguish from numerical failure. Report feasibility and improvement using reference results for the selected candidates.
+
+Computational benefit is measured at comparable design quality. Separate initial dataset/training cost from subsequent searches using an existing model, and estimate the number of evaluations needed to recover that initial cost.
+
+## Layer 4: interface
+
+The interface exposes the same operations used by the numerical workflow:
+
+| Operation | Information shown |
+|---|---|
+| Define/edit a case | Inputs, units, assumptions and derived quantities |
+| Generate/inspect geometry | Shape, named domains, dimensions and geometric checks |
+| Run an evaluation | Selected solver or model, applicability and results |
+| Compare candidates | Changed parameters, fields, objectives, constraints and reference/model provenance |
+| Run a search | Parameter space, budget, progress and selected candidates |
+
+Initial access is through documented files and commands. A graphical interface adds geometry and field inspection. Conversational control is a later input method: an LLM proposes structured case edits through the same execution path, with assumed values visible before a run.
+
+Concrete UI technology, command syntax and visualization/export formats remain open.
+
+## Propulsion families
+
+The intended scope includes the following applications. This list defines coverage; it does not prescribe a class hierarchy or a common physical model.
+
+| Category | Application |
+|---|---|
+| Chemical | Liquid bipropellant (pressure-fed or pump-fed) |
+| Chemical | Liquid monopropellant |
+| Chemical | Solid |
+| Chemical | Hybrid |
+| Electric | Hall-effect thruster |
+| Electric | Gridded ion thruster |
+| Electric | Magnetoplasmadynamic thruster (MPD) |
+| Electric | Microwave electrothermal thruster |
+| Nuclear | Nuclear thermal propulsion (NTP) |
+| Nuclear | Nuclear electric propulsion (NEP) |
+| Nuclear | Fusion propulsion |
+
+Case handling, geometry operations and result comparison are intended to be reusable across applications; physical formulations, reference analyses and trained models are defined per case.
+
+## Development sequence
+
+| Step                            | Deliverable                                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------------------------------- |
+| 1. Controlled numerical example | Parameterized geometry, explicit domains, analytical reference and reproducible solver comparison |
+| 2. Data and inference path      | Small dataset, baseline predictor and comparison with the proposed operator approach              |
+| 3. Search loop                  | Parametric search with selected reference checks and recorded cost/accuracy                       |
+| 4. First propulsion application | One liquid-propulsion problem with defined inputs, outputs and acceptance criteria                |
+| 5. Broader capability           | Coupled analyses, interface improvements and additional physical applications                     |
+
+The controlled example establishes the data and execution path. The propulsion application must demonstrate whether the workflow is useful on a problem with expensive reference analysis.
+
+## Open decisions
+
+| Decision | Needed before |
+|---|---|
+| First propulsion case: parameters, ranges, equations, properties and boundary conditions | Propulsion geometry and dataset implementation |
+| Target output: engineering quantities, surface fields or volume fields | Model architecture selection |
+| Geometry conversion: sampling, distance representation and solver formats | Dataset generation |
+| Exchange schemas and C#/Python integration | Connecting the geometry and model components |
+| Reference solver configuration and numerical checks | Accepting reference data |
+| Error metrics, tolerances and constraints | Model selection and design comparison |
+| Applicability, uncertainty and fallback policy | Automated surrogate-driven search |
+| Search algorithm, reference-check selection and stopping rule | Optimization experiments |
+| Dataset size, supported hardware and runtime budget | Scaling beyond pilot experiments |
+| UI commands, visualization and manufacturing exports | Usable application release |
 
 ## License
 
-Apache 2.0, chosen for consistency with PicoGK's own licensing.
+Apache 2.0. See [LICENSE](LICENSE).
+
+[SGK Mini](https://github.com/matteomafrici/sgk-mini) is a companion experiment for testing the proposed toolchain on a small controlled case.
