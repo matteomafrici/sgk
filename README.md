@@ -1,6 +1,6 @@
 # SGK (Space Generative Kernel)
 
-SGK is a personal open-source project for propulsion analysis and design. The intended workflow is to define an engine case, generate its geometry, evaluate it and compare design changes through a straightforward interface. Cases and results should remain easy to inspect and reuse.
+SGK is a personal open-source project for propulsion analysis and design. The intended workflow is to define an engine case, generate its geometry, evaluate it and compare design changes through a straightforward interface. The longer-term aim is to connect this workflow with test planning and experimental comparison, accounting for facility conditions, sensor response and the intended operating environment. Cases and results should remain easy to inspect and reuse.
 
 The central objective is to bypass expensive simulations during most design iterations through fast model inference. Reference analyses (CFD, FEM or plasma simulations, depending on the problem) provide training data and checks on selected configurations. The software connects preliminary physics, geometry generation, learned models and design search.
 
@@ -21,7 +21,19 @@ The first liquid case is open. A nozzle-flow problem or cooling-channel study is
 
 Manufacturing constraints are part of the intended geometry design. For metal additive manufacturing (L-PBF), this includes wall and channel dimensions, build orientation and access for support or powder removal. Process-specific limits and export requirements remain to be selected.
 
-## Architecture
+## Future developments
+
+The longer-term direction is a propulsion development environment that connects design exploration, test planning and prediction of operation in the intended environment. Fast model inference would support repeated evaluations of candidate designs, operating conditions and measurement setups before committing hardware or facility time.
+
+Environmental inputs would describe either a ground-test facility or the conditions expected during operation in orbit or within a planetary atmosphere. Imported datasets, prescribed profiles or external models would supply pressure, temperature, density, composition, radiation, electromagnetic fields and other relevant loads or disturbances over space and time. Facility models would also represent chamber geometry, pumping and wall interactions. These conditions would enter the physical analysis to predict the propulsion system's response and its interaction with the surroundings.
+
+The interface would allow users to select sensor models and place them on the generated PicoGK geometry or within the surrounding measurement domain. Each model would use documented instrument characteristics and calibration data to represent its measurement range, spatial sensitivity, dynamic response, noise and uncertainty. Applying these models to fields predicted by the learned model or a reference solver would produce expected sensor signals for a proposed test or onboard installation.
+
+Environmental and sensor data would serve both as case inputs and as references for checking the modelling workflow. Analytical and numerical reference cases would check the software implementation; documented measurements from real instruments would support validation of sensor response and comparisons of predicted and recorded signals under known conditions. Data used to fit model parameters would be separated from measurements used to assess predictive accuracy. Dataset provenance, instrument calibration, test configuration and measurement uncertainty would accompany these comparisons.
+
+This would let propulsion developers compare designs in both test and operating conditions, assess facility effects, choose sensor locations and plan informative experiments. Measurements from the resulting tests would then support model refinement and evaluation of subsequent designs.
+
+## Current Architecture
 
 | Layer | Responsibility | Input | Output |
 |---|---|---|---|
@@ -91,6 +103,9 @@ The following names identify logical records. Exact field names, types and file 
 |---|---|---|
 | Case (`EngineConfig`) | Geometry parameters, sizing targets, operating conditions, equations/closures, properties, boundary conditions and assumptions | Complete definition of the physical problem |
 | Geometry | Case identity, voxel/surface representation, dimensions, coordinate frame, resolution, solid/fluid domains and boundary labels | Shared geometric description for meshing, sampling and viewing |
+| Environment | Facility or operating context, geometry where relevant, physical profiles, data/model sources and uncertainty | Conditions and loads applied to the physical case |
+| Measurement setup | Sensor models, positions and orientations, calibration, response characteristics and acquisition settings | Definition of how physical quantities become recorded signals |
+| Experimental record | Case, environment and measurement-setup identity, recorded signals, units, timestamps, provenance and uncertainty | Measured reference for calibration and independent validation |
 | Reference run | Case and geometry identity, solver configuration, fields, integrated quantities, diagnostics and numerical checks | Evidence produced by a reference analysis |
 | Trained model | Architecture/configuration, weights, preprocessing, normalization, input/output definitions, data revision and evaluation report | Reusable predictor with a declared domain of use |
 | Evaluation | Link to a reference run or model inference, engineering quantities, applicability and constraint results | Common summary consumed by the search and comparison interface |
